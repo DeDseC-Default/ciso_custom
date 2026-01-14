@@ -1,0 +1,476 @@
+From fde5a68261824cc08ebecb620ee04460f6b8dad5 Mon Sep 17 00:00:00 2001
+From: Vincent <vincent.plouvier@redsystem.io>
+Date: Tue, 13 Jan 2026 13:18:23 +0100
+Subject: [PATCH] Add recommendation field + doc score surfaces
+
+---
+ backend/core/mappings/engine.py               |  1 +
+ ...25_requirementassessment_recommendation.py | 17 +++++
+ backend/core/models.py                        |  5 ++
+ backend/core/serializers.py                   |  8 ++
+ backend/core/templates/snippets/req_node.html | 13 +++-
+ backend/core/templatetags/core_extras.py      | 16 ++++
+ backend/core/views.py                         |  3 +
+ frontend/messages/en.json                     |  2 +
+ frontend/messages/fr.json                     |  2 +
+ frontend/src/lib/utils/schemas.ts             |  1 +
+ frontend/src/lib/utils/table.ts               | 22 +++++-
+ .../[id=uuid]/table-mode/+page.server.ts      |  2 +
+ .../[id=uuid]/table-mode/+page.svelte         | 74 +++++++++++++------
+ .../compliance-assessments/[id=uuid]/types.ts |  2 +
+ .../[id=uuid]/+page.svelte                    | 36 ++++++---
+ .../[id=uuid]/edit/+page.svelte               |  1 +
+ 16 files changed, 168 insertions(+), 37 deletions(-)
+ create mode 100644 backend/core/migrations/0125_requirementassessment_recommendation.py
+
+diff --git a/backend/core/mappings/engine.py b/backend/core/mappings/engine.py
+index c0083c504..1df37396b 100644
+--- a/backend/core/mappings/engine.py
++++ b/backend/core/mappings/engine.py
+@@ -33,6 +33,7 @@ class MappingEngine:
+             "score",
+             "is_scored",
+             "observation",
++            "recommendation",
+             "documentation_score",
+         ]
+ 
+diff --git a/backend/core/migrations/0125_requirementassessment_recommendation.py b/backend/core/migrations/0125_requirementassessment_recommendation.py
+new file mode 100644
+index 000000000..24934de7c
+--- /dev/null
++++ b/backend/core/migrations/0125_requirementassessment_recommendation.py
+@@ -0,0 +1,17 @@
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("core", "0124_evidencerevision_attachment_hash"),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name="requirementassessment",
++            name="recommendation",
++            field=models.TextField(
++                blank=True, null=True, verbose_name="Recommendation"
++            ),
++        ),
++    ]
+diff --git a/backend/core/models.py b/backend/core/models.py
+index cfb5e1c4d..816906f53 100644
+--- a/backend/core/models.py
++++ b/backend/core/models.py
+@@ -6740,6 +6740,9 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
+         related_name="requirement_assessments",
+     )
+     observation = models.TextField(null=True, blank=True, verbose_name=_("Observation"))
++    recommendation = models.TextField(
++        null=True, blank=True, verbose_name=_("Recommendation")
++    )
+     compliance_assessment = models.ForeignKey(
+         ComplianceAssessment,
+         on_delete=models.CASCADE,
+@@ -6807,12 +6810,14 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
+                     "score": source_requirement_assessment.score,
+                     "is_scored": source_requirement_assessment.is_scored,
+                     "observation": source_requirement_assessment.observation,
++                    "recommendation": source_requirement_assessment.recommendation,
+                 }
+             else:
+                 return {
+                     "result": source_requirement_assessment.result,
+                     "status": source_requirement_assessment.status,
+                     "observation": source_requirement_assessment.observation,
++                    "recommendation": source_requirement_assessment.recommendation,
+                 }
+         if mapping.coverage == RequirementMapping.Coverage.PARTIAL:
+             if source_requirement_assessment.result in (
+diff --git a/backend/core/serializers.py b/backend/core/serializers.py
+index 5111cfa82..5f4bd01aa 100644
+--- a/backend/core/serializers.py
++++ b/backend/core/serializers.py
+@@ -1964,11 +1964,17 @@ class RequirementAssessmentReadSerializer(BaseModelSerializer):
+     security_exceptions = FieldsRelatedField(many=True)
+     is_locked = serializers.BooleanField()
+     applied_controls = FieldsRelatedField(many=True)
++    recommendation = serializers.SerializerMethodField()
+ 
+     class Meta:
+         model = RequirementAssessment
+         fields = "__all__"
+ 
++    def get_recommendation(self, obj):
++        if obj.recommendation is not None:
++            return obj.recommendation
++        return obj.observation
++
+ 
+ class RequirementAssessmentWriteSerializer(BaseModelSerializer):
+     requirement = serializers.PrimaryKeyRelatedField(read_only=True)
+@@ -2181,7 +2187,9 @@ class RequirementAssessmentImportExportSerializer(BaseModelSerializer):
+             "result",
+             "score",
+             "is_scored",
++            "documentation_score",
+             "observation",
++            "recommendation",
+             "compliance_assessment",
+             "requirement",
+             "selected",
+diff --git a/backend/core/templates/snippets/req_node.html b/backend/core/templates/snippets/req_node.html
+index 2e25d9ae7..ba659d551 100644
+--- a/backend/core/templates/snippets/req_node.html
++++ b/backend/core/templates/snippets/req_node.html
+@@ -28,6 +28,11 @@
+             {{ node.assessments.score }}
+           </div>
+           {% endif %}
++          {% if node.assessments.documentation_score is not None %}
++          <div class="text-center whitespace-nowrap px-2 py-1">
++            {% trans "Documentation score:" %} {{ node.assessments.documentation_score }}
++          </div>
++          {% endif %}
+         </div>
+       </div>
+       {% if node.assessments.requirement.description %}
+@@ -56,7 +61,13 @@
+       {% if node.assessments.observation %}
+           <div class="text-left w-full">
+             <p class="font-semibold">{% trans "Observation:" %}</p>
+-            <p>{{ node.assessments.observation }}</p>
++            <p>{{ node.assessments.observation|render_markdown }}</p>
++          </div>
++      {% endif %}
++      {% if node.assessments.recommendation or node.assessments.observation %}
++          <div class="text-left w-full">
++            <p class="font-semibold">{% trans "Recommendation:" %}</p>
++            <p>{{ node.assessments.recommendation|default:node.assessments.observation|render_markdown }}</p>
+           </div>
+       {% endif %}
+     </div>
+diff --git a/backend/core/templatetags/core_extras.py b/backend/core/templatetags/core_extras.py
+index e2ae5cb32..38ac90669 100644
+--- a/backend/core/templatetags/core_extras.py
++++ b/backend/core/templatetags/core_extras.py
+@@ -1,4 +1,6 @@
++import html
+ import os
++import re
+ from django import template
+ from django.utils.safestring import mark_safe
+ 
+@@ -97,6 +99,20 @@ def basename_filter(file_path):
+     return os.path.basename(str(file_path))
+ 
+ 
++@register.filter(name="render_markdown")
++def render_markdown(value):
++    if not value:
++        return ""
++
++    escaped = html.escape(str(value))
++    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
++    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
++    escaped = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<em>\1</em>", escaped)
++    escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', escaped)
++    escaped = escaped.replace("\n", "<br>")
++    return mark_safe(escaped)
++
++
+ @register.simple_tag
+ def bar_graph(assessments, ancestors, node=None):
+     compliance_assessments_result = []
+diff --git a/backend/core/views.py b/backend/core/views.py
+index 79d7fccf2..295438bd9 100644
+--- a/backend/core/views.py
++++ b/backend/core/views.py
+@@ -8162,6 +8162,7 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
+             ref_id = request.data.get("ref_id")
+             result = request.data.get("result")
+             observation = request.data.get("observation")
++            recommendation = request.data.get("recommendation")
+             score = request.data.get("score")
+             status_value = request.data.get("status")
+ 
+@@ -8232,6 +8233,8 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
+             # Update the requirement assessment
+             requirement_assessment.result = result
+             requirement_assessment.observation = observation
++            if "recommendation" in request.data:
++                requirement_assessment.recommendation = recommendation
+ 
+             # Update status if provided
+             if status_value is not None:
+diff --git a/frontend/messages/en.json b/frontend/messages/en.json
+index d83a7b5aa..298d3ec4a 100644
+--- a/frontend/messages/en.json
++++ b/frontend/messages/en.json
+@@ -260,6 +260,8 @@
+ 	"observation": "Observation",
+ 	"observationHelpText": "Additional notes and comments in markdown format",
+ 	"noObservation": "No observation",
++	"recommendation": "Recommendation",
++	"noRecommendation": "No recommendation",
+ 	"requestNotes": "Request notes",
+ 	"approverObservation": "Approver observation",
+ 	"importMatrices": "Import matrices",
+diff --git a/frontend/messages/fr.json b/frontend/messages/fr.json
+index 65b521206..aae572b5e 100644
+--- a/frontend/messages/fr.json
++++ b/frontend/messages/fr.json
+@@ -252,6 +252,8 @@
+ 	"observation": "Observation",
+ 	"observationHelpText": "Notes et commentaires supplémentaires au format markdown",
+ 	"noObservation": "Aucune observation",
++	"recommendation": "Recommandation",
++	"noRecommendation": "Aucune recommandation",
+ 	"requestNotes": "Notes du demandeur",
+ 	"approverObservation": "Observation de l'approbateur",
+ 	"importMatrices": "Importer des matrices",
+diff --git a/frontend/src/lib/utils/schemas.ts b/frontend/src/lib/utils/schemas.ts
+index e4e59e9e5..5069abc74 100644
+--- a/frontend/src/lib/utils/schemas.ts
++++ b/frontend/src/lib/utils/schemas.ts
+@@ -356,6 +356,7 @@ export const RequirementAssessmentSchema = z.object({
+ 	compliance_assessment: z.string(),
+ 	applied_controls: z.array(z.string().uuid().optional()).optional(),
+ 	observation: z.string().optional().nullable(),
++	recommendation: z.string().optional().nullable(),
+ 	security_exceptions: z.string().uuid().optional().array().optional(),
+ 	noRedirect: z.boolean().default(false)
+ });
+diff --git a/frontend/src/lib/utils/table.ts b/frontend/src/lib/utils/table.ts
+index d33777c67..a854e6e9e 100644
+--- a/frontend/src/lib/utils/table.ts
++++ b/frontend/src/lib/utils/table.ts
+@@ -1589,8 +1589,26 @@ export const listViewFields = {
+ 		}
+ 	},
+ 	'requirement-assessments': {
+-		head: ['assessable', 'name', 'description', 'complianceAssessment', 'perimeter', 'result'],
+-		body: ['assessable', 'name', 'description', 'compliance_assessment', 'perimeter', 'result'],
++		head: [
++			'assessable',
++			'name',
++			'description',
++			'recommendation',
++			'documentationScore',
++			'complianceAssessment',
++			'perimeter',
++			'result'
++		],
++		body: [
++			'assessable',
++			'name',
++			'description',
++			'recommendation',
++			'documentation_score',
++			'compliance_assessment',
++			'perimeter',
++			'result'
++		],
+ 		breadcrumb_link_disabled: true,
+ 		filters: {
+ 			compliance_assessment: COMPLIANCE_ASSESSMENT_FILTER,
+diff --git a/frontend/src/routes/(app)/(third-party)/compliance-assessments/[id=uuid]/table-mode/+page.server.ts b/frontend/src/routes/(app)/(third-party)/compliance-assessments/[id=uuid]/table-mode/+page.server.ts
+index c900957e4..6c2e47365 100644
+--- a/frontend/src/routes/(app)/(third-party)/compliance-assessments/[id=uuid]/table-mode/+page.server.ts
++++ b/frontend/src/routes/(app)/(third-party)/compliance-assessments/[id=uuid]/table-mode/+page.server.ts
+@@ -56,6 +56,7 @@ export const load = (async ({ fetch, params }) => {
+ 				}
+ 			);
+ 			const observationBuffer = requirementAssessment.observation;
++			const recommendationBuffer = requirementAssessment.recommendation;
+ 			const scoreForm = await superValidate(
+ 				{
+ 					is_scored: requirementAssessment.is_scored,
+@@ -80,6 +81,7 @@ export const load = (async ({ fetch, params }) => {
+ 				measureCreateForm,
+ 				evidenceCreateForm,
+ 				observationBuffer,
++				recommendationBuffer,
+ 				scoreForm,
+ 				updateForm,
+ 				updatedModel,
+diff --git a/frontend/src/routes/(app)/(third-party)/compliance-assessments/[id=uuid]/table-mode/+page.svelte b/frontend/src/routes/(app)/(third-party)/compliance-assessments/[id=uuid]/table-mode/+page.svelte
+index 388010eb9..08ec23cc5 100644
+--- a/frontend/src/routes/(app)/(third-party)/compliance-assessments/[id=uuid]/table-mode/+page.svelte
++++ b/frontend/src/routes/(app)/(third-party)/compliance-assessments/[id=uuid]/table-mode/+page.svelte
+@@ -272,7 +272,10 @@
+ 		});
+ 	});
+ 
+-	const accordionItems: Record<string, ['' | 'observation' | 'evidence']> = $state(
++	const accordionItems: Record<
++		string,
++		['' | 'observation' | 'recommendation' | 'evidence' | 'appliedControl']
++	> = $state(
+ 		// svelte-ignore state_referenced_locally
+ 		requirementAssessments.reduce((acc, requirementAssessment) => {
+ 			const requirement =
+@@ -742,31 +745,56 @@
+ 											value={accordionItems[requirementAssessment.id]}
+ 											onValueChange={(e) => (accordionItems[requirementAssessment.id] = e.value)}
+ 										>
+-											{#if shallow}
+-												{#if requirementAssessment.observation}
+-													<MarkdownRenderer
+-														content={requirementAssessment.observation}
+-														class="text-primary-500"
++										{#if shallow}
++											{#if requirementAssessment.observation}
++												<MarkdownRenderer
++													content={requirementAssessment.observation}
++													class="text-primary-500"
++												/>
++											{:else}
++												<p class="text-gray-400 italic">{m.noObservation()}</p>
++											{/if}
++										{:else}
++											<Accordion.Item value="observation">
++												{#snippet control()}
++													<p class="flex">{m.observation()}</p>
++												{/snippet}
++												{#snippet panel()}
++													<TableMarkdownField
++														bind:value={requirementAssessment.observation}
++														onSave={async (newValue) => {
++															await update(requirementAssessment, 'observation');
++															requirementAssessment.observationBuffer = newValue;
++														}}
+ 													/>
+-												{:else}
+-													<p class="text-gray-400 italic">{m.noObservation()}</p>
+-												{/if}
++												{/snippet}
++											</Accordion.Item>
++										{/if}
++										{#if shallow}
++											{#if requirementAssessment.recommendation}
++												<MarkdownRenderer
++													content={requirementAssessment.recommendation}
++													class="text-primary-500"
++												/>
+ 											{:else}
+-												<Accordion.Item value="observation">
+-													{#snippet control()}
+-														<p class="flex">{m.observation()}</p>
+-													{/snippet}
+-													{#snippet panel()}
+-														<TableMarkdownField
+-															bind:value={requirementAssessment.observation}
+-															onSave={async (newValue) => {
+-																await update(requirementAssessment, 'observation');
+-																requirementAssessment.observationBuffer = newValue;
+-															}}
+-														/>
+-													{/snippet}
+-												</Accordion.Item>
++												<p class="text-gray-400 italic">{m.noRecommendation()}</p>
+ 											{/if}
++										{:else}
++											<Accordion.Item value="recommendation">
++												{#snippet control()}
++													<p class="flex">{m.recommendation()}</p>
++												{/snippet}
++												{#snippet panel()}
++													<TableMarkdownField
++														bind:value={requirementAssessment.recommendation}
++														onSave={async (newValue) => {
++															await update(requirementAssessment, 'recommendation');
++															requirementAssessment.recommendationBuffer = newValue;
++														}}
++													/>
++												{/snippet}
++											</Accordion.Item>
++										{/if}
+ 
+ 											{#if requirementAssessment.applied_controls.length === 0 && shallow}
+ 												<p class="text-gray-400 italic">{m.noAppliedControlYet()}</p>
+diff --git a/frontend/src/routes/(app)/(third-party)/compliance-assessments/[id=uuid]/types.ts b/frontend/src/routes/(app)/(third-party)/compliance-assessments/[id=uuid]/types.ts
+index 5856738b6..f92241bfb 100644
+--- a/frontend/src/routes/(app)/(third-party)/compliance-assessments/[id=uuid]/types.ts
++++ b/frontend/src/routes/(app)/(third-party)/compliance-assessments/[id=uuid]/types.ts
+@@ -11,5 +11,7 @@ export interface Node {
+ 	result?: string; // The compliance result for assessable nodes
+ 	extended_result?: string; // Extended audit result (nonconformities, observations, etc.)
+ 	score?: number; // Assuming that the score field exists in nodes similar to leaves
++	documentation_score?: number;
+ 	is_scored?: boolean; // Assuming that the is_scored field exists in nodes similar to leaves
++	recommendation?: string;
+ }
+diff --git a/frontend/src/routes/(app)/(third-party)/requirement-assessments/[id=uuid]/+page.svelte b/frontend/src/routes/(app)/(third-party)/requirement-assessments/[id=uuid]/+page.svelte
+index f97b3cfaa..477c12454 100644
+--- a/frontend/src/routes/(app)/(third-party)/requirement-assessments/[id=uuid]/+page.svelte
++++ b/frontend/src/routes/(app)/(third-party)/requirement-assessments/[id=uuid]/+page.svelte
+@@ -104,21 +104,27 @@
+ 			</div>
+ 		{/if}
+ 		{#if data.requirementAssessment.is_scored}
+-			<ProgressRing
+-				strokeWidth="20px"
+-				meterStroke={displayScoreColor(score, max_score)}
+-				value={formatScoreValue(score, max_score)}
+-				classes="shrink-0"
+-				size="size-10">{score}</ProgressRing
+-			>
+-			{#if data.complianceAssessmentScore.show_documentation_score}
++			<div class="flex flex-row items-center space-x-2">
++				<span class="text-xs font-medium">{m.score()}</span>
+ 				<ProgressRing
+ 					strokeWidth="20px"
+-					meterStroke={displayScoreColor(documentationScore, max_score)}
+-					value={formatScoreValue(documentationScore, max_score)}
++					meterStroke={displayScoreColor(score, max_score)}
++					value={formatScoreValue(score, max_score)}
+ 					classes="shrink-0"
+-					size="size-10">{documentationScore}</ProgressRing
++					size="size-10">{score}</ProgressRing
+ 				>
++			</div>
++			{#if data.complianceAssessmentScore.show_documentation_score}
++				<div class="flex flex-row items-center space-x-2">
++					<span class="text-xs font-medium">{m.documentationScore()}</span>
++					<ProgressRing
++						strokeWidth="20px"
++						meterStroke={displayScoreColor(documentationScore, max_score)}
++						value={formatScoreValue(documentationScore, max_score)}
++						classes="shrink-0"
++						size="size-10">{documentationScore}</ProgressRing
++					>
++				</div>
+ 			{/if}
+ 		{/if}
+ 	</div>
+@@ -329,6 +335,14 @@
+ 			</div>
+ 		</div>
+ 	{/if}
++	{#if data.requirementAssessment.recommendation}
++		<div class="card p-4 space-y-2 preset-tonal-primary">
++			<h1 class="font-semibold text-sm">{m.recommendation()}</h1>
++			<div class="text-sm">
++				<MarkdownRenderer content={data.requirementAssessment.recommendation} />
++			</div>
++		</div>
++	{/if}
+ 	<div class="flex flex-row justify-between space-x-4">
+ 		<button class="btn bg-gray-400 text-white font-semibold w-full" type="button" onclick={cancel}
+ 			>{m.back()}</button
+diff --git a/frontend/src/routes/(app)/(third-party)/requirement-assessments/[id=uuid]/edit/+page.svelte b/frontend/src/routes/(app)/(third-party)/requirement-assessments/[id=uuid]/edit/+page.svelte
+index bf9a2d1eb..911604b12 100644
+--- a/frontend/src/routes/(app)/(third-party)/requirement-assessments/[id=uuid]/edit/+page.svelte
++++ b/frontend/src/routes/(app)/(third-party)/requirement-assessments/[id=uuid]/edit/+page.svelte
+@@ -715,6 +715,7 @@
+ 					{/if}
+ 
+ 					<MarkdownField {form} field="observation" label="Observation" />
++					<MarkdownField {form} field="recommendation" label={m.recommendation()} />
+ 					<div class="flex flex-row justify-between space-x-4">
+ 						<button
+ 							class="btn bg-gray-400 text-white font-semibold w-full"
+-- 
+2.51.0
+
